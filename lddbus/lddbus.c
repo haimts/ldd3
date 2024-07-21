@@ -77,7 +77,11 @@ struct bus_type ldd_bus_type = {
 /*
  * Export a simple attribute.
  */
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 static ssize_t version_show(struct bus_type *bus, char *buf)
+#else
+static ssize_t version_show(const struct bus_type *bus, char *buf)
+#endif
 {
 	return snprintf(buf, PAGE_SIZE, "%s\n", Version);
 }

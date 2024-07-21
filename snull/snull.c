@@ -52,6 +52,8 @@ module_param(lockup, int, 0);
 static int timeout = SNULL_TIMEOUT;
 module_param(timeout, int, 0);
 
+const char C_snull_dev_0[] = "\0SNUL0";
+const char C_snull_dev_1[] = "\0SNUL1";
 /*
  * Do we run in NAPI mode?
  */
@@ -213,9 +215,19 @@ int snull_open(struct net_device *dev)
 	 * x is 0 or 1. The first byte is '\0' to avoid being a multicast
 	 * address (the first byte of multicast addrs is odd).
 	 */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,5,0)
 	memcpy(dev->dev_addr, "\0SNUL0", ETH_ALEN);
+#else
+	dev->dev_addr = C_snull_dev_0;
+#endif
 	if (dev == snull_devs[1])
-		dev->dev_addr[ETH_ALEN-1]++; /* \0SNUL1 */
+	{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,5,0)
+	    memcpy(dev->dev_addr, "\0SNUL1", ETH_ALEN); //dev->dev_addr[ETH_ALEN-1]++; /* \0SNUL1 */
+#else
+	    dev->dev_addr = C_snull_dev_1;
+#endif
+	}
 	if (use_napi) {
 		struct snull_priv *priv = netdev_priv(dev);
 		napi_enable(&priv->napi);
@@ -712,7 +724,11 @@ void snull_init(struct net_device *dev)
 	priv = netdev_priv(dev);
 	memset(priv, 0, sizeof(struct snull_priv));
 	if (use_napi) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,5,0)
 		netif_napi_add(dev, &priv->napi, snull_poll,2);
+#else
+		netif_napi_add_weight(dev, &priv->napi, snull_poll,2);
+#endif
 	}
 	spin_lock_init(&priv->lock);
 	priv->dev = dev;

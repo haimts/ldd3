@@ -25,7 +25,11 @@
 #include <linux/hdreg.h>	/* HDIO_GETGEO */
 #include <linux/kdev_t.h>
 #include <linux/vmalloc.h>
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 #include <linux/genhd.h>
+#else
+#include <linux/blkdev.h>
+#endif
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>	/* invalidate_bdev */
 #include <linux/bio.h>
@@ -40,6 +44,40 @@ static int nsectors = 1024;	/* How big the drive is */
 module_param(nsectors, int, 0);
 static int ndevices = 4;
 module_param(ndevices, int, 0);
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
+//[HZ: Don't know what I can put here!]
+#else
+/*
+ * various member access, note that bio_data should of course not be used
+ * on highmem page vectors
+ */
+#define bio_iovec_idx(bio, idx) (&((bio)->bi_io_vec[(idx)]))
+//#define bio_iovec(bio)      bio_iovec_idx((bio), (bio)->bi_idx)
+//#define bio_page(bio)       bio_iovec((bio))->bv_page
+//#define bio_offset(bio)     bio_iovec((bio))->bv_offset
+//#define bio_segments(bio)   ((bio)->bi_vcnt - (bio)->bi_idx)
+//#define bio_sectors(bio)    ((bio)->bi_size >> 9)
+
+static inline unsigned int bio_cur_bytes(struct bio *bio)
+{
+    if (bio->bi_vcnt)
+        return bio_iovec(bio).bv_len;
+    else /* dataless requests such as discard */
+        return bio->bi_iter.bi_size;
+}
+
+#define M_INIT_TAG_SET(TAG_SET) do { \
+    TAG_SET.ops = & mq_ops_full;\
+    TAG_SET.nr_hw_queues = 1;   \
+    TAG_SET.queue_depth = 128;  \
+    TAG_SET.numa_node = NUMA_NO_NODE   ;\
+    TAG_SET.cmd_size = 0;       \
+    TAG_SET.flags = BLK_MQ_F_SHOULD_MERGE;       \
+    TAG_SET.driver_data = dev;  \
+}while(0)
+
+#endif
 
 /*
  * The different "request modes" we can use.
@@ -106,8 +144,10 @@ blk_generic_alloc_queue(int node_id)
 	return (q);
 #elif (LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0))
 	return (blk_alloc_queue(make_request, node_id));
-#else
+#elif (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 	return (blk_alloc_queue(node_id));
+#else
+	return (blk_alloc_disk(node_id)->part0->bd_queue);
 #endif
 }
 
@@ -137,7 +177,11 @@ static void sbull_transfer(struct sbull_dev *dev, unsigned long sector,
 static blk_status_t sbull_request(struct blk_mq_hw_ctx *hctx, const struct blk_mq_queue_data* bd)   /* For blk-mq */
 {
 	struct request *req = bd->rq;
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 	struct sbull_dev *dev = req->rq_disk->private_data;
+#else
+	struct sbull_dev *dev = req->q->disk->private_data;
+#endif
         struct bio_vec bvec;
         struct req_iterator iter;
         sector_t pos_sector = blk_rq_pos(req);
@@ -250,29 +294,45 @@ static blk_status_t sbull_full_request(struct blk_mq_hw_ctx * hctx, const struct
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0))
 //static void sbull_make_request(struct request_queue *q, struct bio *bio)
 static blk_qc_t sbull_make_request(struct request_queue *q, struct bio *bio)
-#else
+#elif (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 static blk_qc_t sbull_make_request(struct bio *bio)
+#else
+static void sbull_make_request(struct bio *bio)
 #endif
 {
 	//struct sbull_dev *dev = q->queuedata;
-	struct sbull_dev *dev = bio->bi_disk->private_data;
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
+    struct sbull_dev *dev = bio->bi_disk->private_data;
+#else
+	struct sbull_dev *dev = bio->bi_bdev->bd_disk->private_data;
+#endif
 	int status;
 
 	status = sbull_xfer_bio(dev, bio);
 	bio->bi_status = status;
 	bio_endio(bio);
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 	return BLK_QC_T_NONE;
+#else
+	return;
+#endif
 }
 
 
 /*
  * Open and close.
  */
-
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 static int sbull_open(struct block_device *bdev, fmode_t mode)
+#else
+static int sbull_open(struct gendisk *disk, fmode_t mode)
+#endif
 {
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 	struct sbull_dev *dev = bdev->bd_disk->private_data;
-
+#else
+	struct sbull_dev *dev = disk->private_data;
+#endif
 	del_timer_sync(&dev->timer);
 	//filp->private_data = dev;
 	spin_lock(&dev->lock);
@@ -280,7 +340,7 @@ static int sbull_open(struct block_device *bdev, fmode_t mode)
 	{
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0))
 		check_disk_change(bdev);
-#else
+#elif (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
                 /* For newer kernels (as of 5.10), bdev_check_media_change()
                  * is used, in favor of check_disk_change(),
                  * with the modification that invalidation
@@ -293,6 +353,11 @@ static int sbull_open(struct block_device *bdev, fmode_t mode)
                         if (bdo && bdo->revalidate_disk)
                                 bdo->revalidate_disk(gd);
                 }
+#else
+                if(disk_check_media_change(disk))
+                {
+                    blk_revalidate_disk_zones(disk, disk_update_readahead);
+                }
 #endif
 	}
 	dev->users++;
@@ -300,7 +365,11 @@ static int sbull_open(struct block_device *bdev, fmode_t mode)
 	return 0;
 }
 
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 static void sbull_release(struct gendisk *disk, fmode_t mode)
+#else
+static void sbull_release(struct gendisk *disk)
+#endif
 {
 	struct sbull_dev *dev = disk->private_data;
 
@@ -407,7 +476,9 @@ static struct block_device_operations sbull_ops = {
 #else
 	.submit_bio      = sbull_make_request,
 #endif
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 	.revalidate_disk = sbull_revalidate,
+#endif
 	.ioctl	         = sbull_ioctl
 };
 
@@ -425,6 +496,7 @@ static struct blk_mq_ops mq_ops_full = {
  */
 static void setup_device(struct sbull_dev *dev, int which)
 {
+    int ret;
 	/*
 	 * Get some memory.
 	 */
@@ -447,8 +519,6 @@ static void setup_device(struct sbull_dev *dev, int which)
 #else
         timer_setup(&dev->timer, sbull_invalidate, 0);
 #endif
-
-
 	
 	/*
 	 * The I/O queue, depending on whether we are using our own
@@ -466,10 +536,26 @@ static void setup_device(struct sbull_dev *dev, int which)
 		break;
 
 	    case RM_FULL:
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 		//dev->queue = blk_init_queue(sbull_full_request, &dev->lock);
 		dev->queue = blk_mq_init_sq_queue(&dev->tag_set, &mq_ops_full, 128, BLK_MQ_F_SHOULD_MERGE);
 		if (dev->queue == NULL)
 			goto out_vfree;
+#else
+		M_INIT_TAG_SET(dev->tag_set);
+
+        ret = blk_mq_alloc_tag_set (& dev->tag_set);
+        if (ret) {
+            printk (KERN_WARNING "sblkdev: unable to allocate tag set  n");
+            break;
+        }
+        dev->queue = blk_mq_init_queue (& dev-> tag_set);
+        if (IS_ERR (dev->queue)) {
+            ret = PTR_ERR (dev->queue);
+            printk (KERN_WARNING "sblkdev: Failed to allocate queue  n");
+            break;
+        }
+#endif
 		break;
 
 	    default:
@@ -477,10 +563,26 @@ static void setup_device(struct sbull_dev *dev, int which)
         	/* fall into.. */
 	
 	    case RM_SIMPLE:
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 		//dev->queue = blk_init_queue(sbull_request, &dev->lock);
 		dev->queue = blk_mq_init_sq_queue(&dev->tag_set, &mq_ops_simple, 128, BLK_MQ_F_SHOULD_MERGE);
 		if (dev->queue == NULL)
 			goto out_vfree;
+#else
+        M_INIT_TAG_SET(dev->tag_set);
+
+        ret = blk_mq_alloc_tag_set (& dev->tag_set);
+        if (ret) {
+            printk (KERN_WARNING "sblkdev: unable to allocate tag set  n");
+            break;
+        }
+        dev->queue = blk_mq_init_queue (& dev-> tag_set);
+        if (IS_ERR (dev->queue)) {
+            ret = PTR_ERR (dev->queue);
+            printk (KERN_WARNING "sblkdev: Failed to allocate queue  n");
+            break;
+        }
+#endif
 		break;
 	}
 	blk_queue_logical_block_size(dev->queue, hardsect_size);
@@ -488,7 +590,11 @@ static void setup_device(struct sbull_dev *dev, int which)
 	/*
 	 * And the gendisk structure.
 	 */
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 	dev->gd = alloc_disk(SBULL_MINORS);
+#else
+	dev->gd = blk_alloc_disk(SBULL_MINORS);
+#endif
 	if (! dev->gd) {
 		printk (KERN_NOTICE "alloc_disk failure\n");
 		goto out_vfree;
@@ -554,7 +660,11 @@ static void sbull_exit(void)
 				//kobject_put (&dev->queue->kobj);
 				blk_put_queue(dev->queue);
 			else
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0))
 				blk_cleanup_queue(dev->queue);
+#else
+			    blk_mq_destroy_queue(dev->queue);
+#endif
 		}
 		if (dev->data)
 			vfree(dev->data);
